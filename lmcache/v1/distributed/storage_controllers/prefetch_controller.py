@@ -141,6 +141,8 @@ class InFlightPrefetchRequest:
     keys: list[ObjectKey]
     layout_desc: MemoryLayoutDesc
     phase: PrefetchPhase
+    selector_policy: PrefetchPolicy
+    """Prefetch selector policy snapshotted when this request was submitted."""
     extra_count: int = 0
     """Extra read locks per key (on top of the default 1) to acquire when
     transitioning from write-locked to read-locked.  Must match the
@@ -199,6 +201,7 @@ class PrefetchController(StorageControllerInterface):
         l2_adapters: List of L2 adapter instances.
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The prefetch policy for load plan decisions.
+        policy_name: Registered name of ``policy`` for status reporting.
         max_in_flight: Maximum number of concurrent prefetch requests.
     """
 
@@ -216,6 +219,7 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[AdapterDescriptor],
         policy: PrefetchPolicy,
         max_in_flight: int = 8,
+        policy_name: str | None = None,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters: dict[int, L2AdapterInterface] = {
@@ -225,7 +229,9 @@ class PrefetchController(StorageControllerInterface):
         self._adapter_descriptors: dict[int, AdapterDescriptor] = {
             desc.index: desc for desc in adapter_descriptors
         }
+        self._policy_lock = threading.Lock()
         self._policy = policy
+        self._policy_name = policy_name or type(policy).__name__
         self._max_in_flight = max_in_flight
 
         # Adapters that are being drained and will be removed after all
@@ -240,7 +246,9 @@ class PrefetchController(StorageControllerInterface):
 
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
-        self._pending_queue: list[tuple[PrefetchRequestId, PrefetchRequestSpec]] = []
+        self._pending_queue: list[
+            tuple[PrefetchRequestId, PrefetchRequestSpec, PrefetchPolicy]
+        ] = []
 
         # Shadow counters for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
@@ -250,7 +258,9 @@ class PrefetchController(StorageControllerInterface):
 
         # Thread-safe submission queue (external -> background)
         self._submission_lock = threading.Lock()
-        self._submission_queue: list[tuple[PrefetchRequestId, PrefetchRequestSpec]] = []
+        self._submission_queue: list[
+            tuple[PrefetchRequestId, PrefetchRequestSpec, PrefetchPolicy]
+        ] = []
         self._next_request_id: PrefetchRequestId = 0
         self._submission_efd = create_event_notifier()
 
@@ -350,10 +360,12 @@ class PrefetchController(StorageControllerInterface):
         Returns:
             A request ID for tracking via query_prefetch_result.
         """
+        with self._policy_lock:
+            policy = self._policy
         with self._submission_lock:
             request_id = self._next_request_id
             self._next_request_id += 1
-            self._submission_queue.append((request_id, spec))
+            self._submission_queue.append((request_id, spec, policy))
         self._submission_efd.notify()
         return request_id
 
@@ -434,6 +446,8 @@ class PrefetchController(StorageControllerInterface):
     def report_status(self) -> dict:
         """Return a status dict for the prefetch controller."""
         is_healthy = self._thread.is_alive()
+        with self._policy_lock:
+            policy_name = self._policy_name
         with self._submission_lock:
             submission_queue_size = len(self._submission_queue)
         with self._prefetch_results_lock:
@@ -451,7 +465,23 @@ class PrefetchController(StorageControllerInterface):
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - len(self._draining),
             "num_draining_adapters": len(self._draining),
+            "prefetch_policy": policy_name,
         }
+
+    def update_policy(self, policy_name: str, policy: PrefetchPolicy) -> None:
+        """Replace the selector used by future prefetch requests.
+
+        Requests snapshot their policy at submission time. A request already
+        queued, looking up, or loading therefore retains the selector that
+        accepted it and is never replanned by a subsequent update.
+
+        Args:
+            policy_name: Registered name of the replacement prefetch policy.
+            policy: Instantiated replacement policy.
+        """
+        with self._policy_lock:
+            self._policy = policy
+            self._policy_name = policy_name
 
     def get_adapter_state_observations(
         self,
@@ -736,9 +766,9 @@ class PrefetchController(StorageControllerInterface):
         while (
             self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
         ):
-            request_id, spec = self._pending_queue.pop(0)
+            request_id, spec, policy = self._pending_queue.pop(0)
             self._status_pending_count -= 1
-            self._start_lookup_phase(request_id, spec)
+            self._start_lookup_phase(request_id, spec, policy)
 
     # =========================================================================
     # Lookup phase
@@ -748,9 +778,15 @@ class PrefetchController(StorageControllerInterface):
         self,
         request_id: PrefetchRequestId,
         spec: PrefetchRequestSpec,
+        selector_policy: PrefetchPolicy,
     ) -> None:
-        """Submit lookup_and_lock to all live (non-draining) adapters for a
-        new request."""
+        """Submit lookup tasks for a request using its policy snapshot.
+
+        Args:
+            request_id: Identifier assigned at submission time.
+            spec: Request inputs to forward to active adapters.
+            selector_policy: Policy snapshot selected when the request arrived.
+        """
         # Skip adapters being drained so a new request never locks keys on
         # an adapter that is on its way out.
         routing_adapters = {
@@ -772,6 +808,7 @@ class PrefetchController(StorageControllerInterface):
             keys=spec.keys,
             layout_desc=spec.layout_desc,
             phase=PrefetchPhase.LOOKUP,
+            selector_policy=selector_policy,
             extra_count=spec.extra_count,
             policy=spec.policy,
             attn_desc=spec.attn_desc,
@@ -811,7 +848,7 @@ class PrefetchController(StorageControllerInterface):
             for adapter_id, desc in self._adapter_descriptors.items()
             if adapter_id not in self._draining
         ]
-        load_plan = self._policy.select_load_plan(
+        load_plan = request.selector_policy.select_load_plan(
             request.keys,
             request.lookup_results,
             routing_descriptors,
@@ -849,7 +886,7 @@ class PrefetchController(StorageControllerInterface):
         if request.mode is PrefetchMode.WARM:
             retentions = [True] * len(keys_to_reserve)
         else:
-            retentions = self._policy.select_l1_retentions(
+            retentions = request.selector_policy.select_l1_retentions(
                 keys_to_reserve,
             )
         write_results = l1_mgr.reserve_write(

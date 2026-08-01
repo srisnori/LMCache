@@ -192,6 +192,7 @@ class StorageManager:
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
+            policy_name=config.prefetch_policy,
         )
         self._prefetch_controller.start()
 
@@ -1072,10 +1073,20 @@ class StorageManager:
             )
             if result.errors:
                 return result
+            store_policy = None
             if "store_policy" in result.applied_fields:
+                store_policy = create_store_policy(result.state.store_policy)
+            prefetch_policy = None
+            if "prefetch_policy" in result.applied_fields:
+                prefetch_policy = create_prefetch_policy(result.state.prefetch_policy)
+
+            if store_policy is not None:
                 self._store_controller.update_policy(
-                    result.state.store_policy,
-                    create_store_policy(result.state.store_policy),
+                    result.state.store_policy, store_policy
+                )
+            if prefetch_policy is not None:
+                self._prefetch_controller.update_policy(
+                    result.state.prefetch_policy, prefetch_policy
                 )
             self._runtime_policy_state = result.state
             return result

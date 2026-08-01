@@ -34,6 +34,19 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
+from lmcache.v1.distributed.runtime_policy import (
+    EvictionTunables,
+    L1EvictionPolicyState,
+    L2EvictionPolicyState,
+    RuntimePolicyApplyResult,
+    RuntimePolicyCapabilities,
+    RuntimePolicyState,
+    RuntimePolicyUpdate,
+    RuntimePolicyValidationResult,
+    apply_runtime_policy_update,
+    build_runtime_policy_capabilities,
+    validate_runtime_policy_update,
+)
 from lmcache.v1.distributed.serde import create_serde_processor
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
@@ -44,10 +57,12 @@ from lmcache.v1.distributed.storage_controllers import (
 )
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
+    get_registered_prefetch_policies,
 )
 from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     create_store_policy,
+    get_registered_store_policies,
 )
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
@@ -115,6 +130,7 @@ class StorageManager:
         # counts which the base class tracks regardless of capacity,
         # so they are wired up unconditionally.
         l2_eviction_states: list[L2AdapterEvictionState] = []
+        runtime_l2_eviction_states: list[L2EvictionPolicyState] = []
         for adapter_id, ac in zip(
             self._l2_adapters, config.l2_adapter_config.adapters, strict=True
         ):
@@ -128,8 +144,32 @@ class StorageManager:
                         eviction_config=ac.eviction_config,
                     )
                 )
+                runtime_l2_eviction_states.append(
+                    L2EvictionPolicyState(
+                        adapter_id=adapter_id,
+                        adapter_name=self._adapter_descriptors[adapter_id].type_name,
+                        policy=ac.eviction_config.eviction_policy,
+                        tunables=self._eviction_tunables_from_config(
+                            ac.eviction_config
+                        ),
+                    )
+                )
         self._l2_eviction_controller = L2EvictionController(
             l2_eviction_states, quota_manager=self._quota_manager
+        )
+
+        # Runtime overrides remain separate from startup configuration and
+        # are protected by one lock so validation and application observe a
+        # single, consistent policy version.
+        self._runtime_policy_lock = threading.Lock()
+        self._runtime_policy_state = RuntimePolicyState(
+            store_policy=config.store_policy,
+            prefetch_policy=config.prefetch_policy,
+            l1_eviction=L1EvictionPolicyState(
+                policy=config.eviction_config.eviction_policy,
+                tunables=self._eviction_tunables_from_config(config.eviction_config),
+            ),
+            l2_eviction=tuple(runtime_l2_eviction_states),
         )
         self._l2_eviction_controller.start()
 
@@ -889,6 +929,11 @@ class StorageManager:
                         eviction_config=config.eviction_config,
                     )
                 )
+                self._add_runtime_l2_eviction_policy(
+                    adapter_id,
+                    descriptor.type_name,
+                    config.eviction_config,
+                )
             logger.info("Added L2 adapter %d (%s)", adapter_id, descriptor.type_name)
             return adapter_id
 
@@ -927,6 +972,7 @@ class StorageManager:
                 )
 
             self._l2_eviction_controller.remove_adapter_state(adapter_id)
+            self._remove_runtime_l2_eviction_policy(adapter_id)
             with self._adapters_lock:
                 adapter = self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
@@ -946,6 +992,87 @@ class StorageManager:
         return [
             (desc, adapter) for _adapter_id, desc, adapter in self._snapshot_adapters()
         ]
+
+    def get_runtime_policy(self) -> RuntimePolicyState:
+        """Return the current local runtime management-policy state.
+
+        The returned value is immutable and represents process-local runtime
+        overrides only. Startup configuration and lifecycle-plane settings are
+        intentionally not modified by policy updates.
+
+        Returns:
+            The current state, including its optimistic-concurrency version.
+        """
+        with self._runtime_policy_lock:
+            return self._runtime_policy_state
+
+    def get_runtime_policy_capabilities(self) -> RuntimePolicyCapabilities:
+        """Return the safe runtime-policy update surface for this node.
+
+        Selector capabilities are derived from the policy registries and L2
+        eviction entries include only adapters with an active eviction
+        controller. This prevents the API layer from hard-coding policy names
+        or update rules.
+
+        Returns:
+            Capability metadata for selectors and eviction tunables.
+        """
+        return build_runtime_policy_capabilities(
+            self.get_runtime_policy(),
+            registered_store_policies=get_registered_store_policies(),
+            registered_prefetch_policies=get_registered_prefetch_policies(),
+        )
+
+    def validate_runtime_policy_update(
+        self,
+        update: RuntimePolicyUpdate,
+    ) -> RuntimePolicyValidationResult:
+        """Validate a policy update without mutating live runtime state.
+
+        Args:
+            update: Desired selector and/or eviction-tunable changes.
+
+        Returns:
+            A validation result. A valid result identifies every field that
+            would change; an invalid result contains structured errors and no
+            partially applied fields.
+        """
+        with self._runtime_policy_lock:
+            return validate_runtime_policy_update(
+                update,
+                self._runtime_policy_state,
+                registered_store_policies=get_registered_store_policies(),
+                registered_prefetch_policies=get_registered_prefetch_policies(),
+            )
+
+    def update_runtime_policy(
+        self,
+        update: RuntimePolicyUpdate,
+    ) -> RuntimePolicyApplyResult:
+        """Atomically validate and apply a local runtime-policy update.
+
+        The policy version changes only after the complete request validates.
+        Failed requests return the original immutable state, so no caller can
+        observe partial application. Controller propagation is deliberately
+        kept behind this manager boundary; subsequent controller work can add
+        it without changing callers or the API contract.
+
+        Args:
+            update: Desired selector and/or eviction-tunable changes.
+
+        Returns:
+            The application outcome and the resulting runtime policy state.
+        """
+        with self._runtime_policy_lock:
+            result = apply_runtime_policy_update(
+                update,
+                self._runtime_policy_state,
+                registered_store_policies=get_registered_store_policies(),
+                registered_prefetch_policies=get_registered_prefetch_policies(),
+            )
+            if not result.errors:
+                self._runtime_policy_state = result.state
+            return result
 
     # Management APIs
     def clear(self, force: bool = False):
@@ -978,6 +1105,7 @@ class StorageManager:
 
     def report_status(self) -> dict:
         """Return a status dict aggregating all sub-component statuses."""
+        runtime_policy = self.get_runtime_policy()
         l1 = self._l1_manager.report_status()
         store = self._store_controller.report_status()
         prefetch = self._prefetch_controller.report_status()
@@ -994,6 +1122,7 @@ class StorageManager:
             "l2_eviction_controller": l2_eviction,
             "l2_adapters": adapters,
             "num_l2_adapters": len(adapters),
+            "runtime_policy_version": runtime_policy.version,
         }
 
     def register_l2_listener(self, listener: L2AdapterListener) -> None:
@@ -1131,3 +1260,47 @@ class StorageManager:
         if adapter_index < 0 or adapter_index >= len(adapters):
             raise L2ReconfigureError(404, "L2 adapter not reconfigurable")
         return adapters[adapter_index][1]
+
+    @staticmethod
+    def _eviction_tunables_from_config(
+        config: EvictionConfig,
+    ) -> EvictionTunables:
+        """Build immutable runtime tunables from an eviction config."""
+
+        return EvictionTunables(
+            trigger_watermark=config.trigger_watermark,
+            eviction_ratio=config.eviction_ratio,
+        )
+
+    def _add_runtime_l2_eviction_policy(
+        self,
+        adapter_id: int,
+        adapter_name: str,
+        config: EvictionConfig,
+    ) -> None:
+        """Record an enabled L2 eviction controller in policy state."""
+
+        entry = L2EvictionPolicyState(
+            adapter_id=adapter_id,
+            adapter_name=adapter_name,
+            policy=config.eviction_policy,
+            tunables=self._eviction_tunables_from_config(config),
+        )
+        with self._runtime_policy_lock:
+            self._runtime_policy_state = replace(
+                self._runtime_policy_state,
+                l2_eviction=self._runtime_policy_state.l2_eviction + (entry,),
+            )
+
+    def _remove_runtime_l2_eviction_policy(self, adapter_id: int) -> None:
+        """Remove an L2 eviction controller from policy state."""
+
+        with self._runtime_policy_lock:
+            self._runtime_policy_state = replace(
+                self._runtime_policy_state,
+                l2_eviction=tuple(
+                    entry
+                    for entry in self._runtime_policy_state.l2_eviction
+                    if entry.adapter_id != adapter_id
+                ),
+            )

@@ -183,6 +183,9 @@ class InFlightStoreTask:
     """The subset of keys for which reserve_read succeeded
     (i.e., keys holding an L1 read lock that must be released)."""
 
+    policy: StorePolicy
+    """Store policy selected when this task's store plan was created."""
+
     l2_store_result: bool | None = None
     """L2 outcome (True=success, False=failure, None=still in flight)."""
 
@@ -214,6 +217,7 @@ class StoreController(StorageControllerInterface):
         l2_adapters: List of L2 adapter instances.
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The store policy for deciding targets and deletions.
+        policy_name: Registered name of ``policy`` for status reporting.
     """
 
     # Singleton dispatch for ``lmcache_mp.num_inflight_l2_stores``: tests may
@@ -229,6 +233,7 @@ class StoreController(StorageControllerInterface):
         l2_adapters: list[L2AdapterInterface],
         adapter_descriptors: list[AdapterDescriptor],
         policy: StorePolicy,
+        policy_name: str | None = None,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters: dict[int, L2AdapterInterface] = {
@@ -238,7 +243,9 @@ class StoreController(StorageControllerInterface):
         self._adapter_descriptors: dict[int, AdapterDescriptor] = {
             desc.index: desc for desc in adapter_descriptors
         }
+        self._policy_lock = threading.Lock()
         self._policy = policy
+        self._policy_name = policy_name or type(policy).__name__
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -324,6 +331,8 @@ class StoreController(StorageControllerInterface):
         """Return a status dict for the store controller."""
         is_healthy = self._thread.is_alive()
         num_draining = len(self._draining)
+        with self._policy_lock:
+            policy_name = self._policy_name
         return {
             "is_healthy": is_healthy,
             "thread_alive": is_healthy,
@@ -332,7 +341,23 @@ class StoreController(StorageControllerInterface):
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - num_draining,
             "num_draining_adapters": num_draining,
+            "store_policy": policy_name,
         }
+
+    def update_policy(self, policy_name: str, policy: StorePolicy) -> None:
+        """Replace the store selector used by future store plans.
+
+        Store tasks already submitted to L2 retain a reference to the policy
+        that created their plan, so this operation neither reroutes them nor
+        changes their L1 cleanup decision after completion.
+
+        Args:
+            policy_name: Registered name of the replacement store policy.
+            policy: Instantiated replacement policy.
+        """
+        with self._policy_lock:
+            self._policy = policy
+            self._policy_name = policy_name
 
     def add_adapter(
         self,
@@ -580,7 +605,9 @@ class StoreController(StorageControllerInterface):
             for adapter_id, desc in self._adapter_descriptors.items()
             if adapter_id not in self._draining
         ]
-        plan = self._policy.select_store_targets(keys, routing_descriptors)
+        with self._policy_lock:
+            policy = self._policy
+            plan = policy.select_store_targets(keys, routing_descriptors)
 
         l1_mgr = self._l1_manager
 
@@ -659,6 +686,7 @@ class StoreController(StorageControllerInterface):
                 adapter_index=adapter_index,
                 keys=successful_keys,
                 read_locked_keys=list(successful_keys),
+                policy=policy,
             )
             self._status_in_flight_count += 1
 
@@ -759,7 +787,7 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(task.keys),
             )
-            delete_keys = self._policy.select_l1_deletions(task.keys)
+            delete_keys = task.policy.select_l1_deletions(task.keys)
             if delete_keys:
                 l1_mgr.delete(delete_keys)
         else:

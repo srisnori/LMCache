@@ -181,6 +181,7 @@ class StorageManager:
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_store_policy(config.store_policy),
+            policy_name=config.store_policy,
         )
         self._store_controller.start()
 
@@ -1053,9 +1054,8 @@ class StorageManager:
 
         The policy version changes only after the complete request validates.
         Failed requests return the original immutable state, so no caller can
-        observe partial application. Controller propagation is deliberately
-        kept behind this manager boundary; subsequent controller work can add
-        it without changing callers or the API contract.
+        observe partial application. Supported controller mutations are made
+        before publishing the new state through this manager boundary.
 
         Args:
             update: Desired selector and/or eviction-tunable changes.
@@ -1070,8 +1070,14 @@ class StorageManager:
                 registered_store_policies=get_registered_store_policies(),
                 registered_prefetch_policies=get_registered_prefetch_policies(),
             )
-            if not result.errors:
-                self._runtime_policy_state = result.state
+            if result.errors:
+                return result
+            if "store_policy" in result.applied_fields:
+                self._store_controller.update_policy(
+                    result.state.store_policy,
+                    create_store_policy(result.state.store_policy),
+                )
+            self._runtime_policy_state = result.state
             return result
 
     # Management APIs
